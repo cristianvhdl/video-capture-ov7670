@@ -1,0 +1,1 @@
+# video-capture-ov7670
