@@ -1,0 +1,1030 @@
+
+
+http://hamsterworks.co.nz/mediawiki/index.php/OV7670_camera
+OV7670 camera
+This FPGA project was started in November 2012.
+I've got an inexpensive camera module that I have mostly working with an FPGA. It might prove useful to anybody who wants to play with real time image processing. This is very much based on a design by Voelker - more details of his design can be found here.
+Camera design.png
+Due to the resources in the FPGA, and the 6-bit "RGB 3-3-2" VGA interface on the development board it only holds a 160x120 frame. Next step might be to move the frame buffer into DRAM.
+And here is a screen shot showing just how close if can focus:
+Camera result.png
+NOTE: Please look at Zedboard_OV7670 for an updated register set with better colour and contrast
+Contents [hide]
+1 The camera's interface
+2 Source
+2.1 ov7670_top.vhd
+2.2 debounce.vhd
+2.3 ov7670_capture.vhd
+2.4 ov7670_controller.vhd
+2.5 ov7670_registers.vhd
+2.6 i2c_sender.vhd
+2.7 vga.vhd
+2.8 nexys2.ucf
+2.9 ov7670_capture.vhd - Version 2.0
+The camera's interface
+
+Camera interface.png
+Full specs are in the datasheet and in the implmentation guide
+Signal	Usage	Active
+3V3	3.3V power	
+Gnd	Ground	
+SIOC	Serial command bus clock (up to 400KHz)	
+SIOD	Serial command bus data	
+VSYNC	Vertical Sync	Active High, configurable
+HREF	CE output for pixel sampling	Active High, configurable
+PCLK	Pixel Clock	
+XCLK	System clock (10-48MHz, 24MHz Typ)	
+D0-D7	Pixel data	
+RESET	Device Reset	Active Low
+PWDN	Device Power Down	Active High
+Source
+
+Here are all the sources for all the components, except the block of memory where I've used an IP Block Memory Generator.
+There is plenty of tuning options for the camera.
+ov7670_top.vhd
+----------------------------------------------------------------------------------
+-- Engineer: Mike Field <hamster@snap.net.nz>
+-- 
+-- Description: Top level for the OV7670 camera project.
+----------------------------------------------------------------------------------
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+
+entity ov7670_top is
+    Port ( 
+      clk50        : in    STD_LOGIC;
+      OV7670_SIOC  : out   STD_LOGIC;
+      OV7670_SIOD  : inout STD_LOGIC;
+      OV7670_RESET : out   STD_LOGIC;
+      OV7670_PWDN  : out   STD_LOGIC;
+      OV7670_VSYNC : in    STD_LOGIC;
+      OV7670_HREF  : in    STD_LOGIC;
+      OV7670_PCLK  : in    STD_LOGIC;
+      OV7670_XCLK  : out   STD_LOGIC;
+      OV7670_D     : in    STD_LOGIC_VECTOR(7 downto 0);
+
+      LED          : out    STD_LOGIC_VECTOR(7 downto 0);
+
+      vga_red      : out   STD_LOGIC_VECTOR(2 downto 0);
+      vga_green    : out   STD_LOGIC_VECTOR(2 downto 0);
+      vga_blue     : out   STD_LOGIC_VECTOR(2 downto 1);
+      vga_hsync    : out   STD_LOGIC;
+      vga_vsync    : out   STD_LOGIC;
+      
+      btn           : in    STD_LOGIC
+    );
+end ov7670_top;
+
+architecture Behavioral of ov7670_top is
+
+   COMPONENT debounce
+   PORT(
+      clk : IN std_logic;
+      i : IN std_logic;          
+      o : OUT std_logic
+      );
+   END COMPONENT;
+
+   COMPONENT ov7670_controller
+   PORT(
+      clk   : IN    std_logic;    
+      resend: IN    std_logic;    
+      config_finished : out std_logic;
+      siod  : INOUT std_logic;      
+      sioc  : OUT   std_logic;
+      reset : OUT   std_logic;
+      pwdn  : OUT   std_logic;
+      xclk  : OUT   std_logic
+      );
+   END COMPONENT;
+
+   COMPONENT frame_buffer
+   PORT (
+      clka  : IN  STD_LOGIC;
+      wea   : IN  STD_LOGIC_VECTOR(0 DOWNTO 0);
+      addra : IN  STD_LOGIC_VECTOR(14 DOWNTO 0);
+      dina  : IN  STD_LOGIC_VECTOR(7 DOWNTO 0);
+      clkb  : IN  STD_LOGIC;
+      addrb : IN  STD_LOGIC_VECTOR(14 DOWNTO 0);
+      doutb : OUT STD_LOGIC_VECTOR(7 DOWNTO 0)
+   );
+   END COMPONENT;
+
+   COMPONENT ov7670_capture
+   PORT(
+      pclk : IN std_logic;
+      vsync : IN std_logic;
+      href  : IN std_logic;
+      d     : IN std_logic_vector(7 downto 0);          
+      addr  : OUT std_logic_vector(14 downto 0);
+      dout  : OUT std_logic_vector(7 downto 0);
+      we    : OUT std_logic
+      );
+   END COMPONENT;
+
+
+   COMPONENT vga
+   PORT(
+      clk50 : IN std_logic;
+      vga_red : OUT std_logic_vector(2 downto 0);
+      vga_green : OUT std_logic_vector(2 downto 0);
+      vga_blue : OUT std_logic_vector(2 downto 1);
+      vga_hsync : OUT std_logic;
+      vga_vsync : OUT std_logic;
+      
+      frame_addr : OUT std_logic_vector(14 downto 0);
+      frame_pixel : IN std_logic_vector(7 downto 0)         
+      );
+   END COMPONENT;
+   
+   signal frame_addr  : std_logic_vector(14 downto 0);
+   signal frame_pixel : std_logic_vector(7 downto 0);
+
+   signal capture_addr  : std_logic_vector(14 downto 0);
+   signal capture_data  : std_logic_vector(7 downto 0);
+   signal capture_we    : std_logic_vector(0 downto 0);
+   signal resend : std_logic;
+   signal config_finished : std_logic;
+
+begin
+btn_debounce: debounce PORT MAP(
+      clk => clk50,
+      i   => btn,
+      o   => resend
+   );
+
+   Inst_vga: vga PORT MAP(
+      clk50       => clk50,
+      vga_red     => vga_red,
+      vga_green   => vga_green,
+      vga_blue    => vga_blue,
+      vga_hsync   => vga_hsync,
+      vga_vsync   => vga_vsync,
+      frame_addr  => frame_addr,
+      frame_pixel => frame_pixel
+   );
+
+fb : frame_buffer
+  PORT MAP (
+    clka  => OV7670_PCLK,
+    wea   => capture_we,
+    addra => capture_addr,
+    dina  => capture_data,
+    
+    clkb  => clk50,
+    addrb => frame_addr,
+    doutb => frame_pixel
+  );
+  led <= "0000000" & config_finished;
+  
+capture: ov7670_capture PORT MAP(
+      pclk  => OV7670_PCLK,
+      vsync => OV7670_VSYNC,
+      href  => OV7670_HREF,
+      d     => OV7670_D,
+      addr  => capture_addr,
+      dout  => capture_data,
+      we    => capture_we(0)
+   );
+  
+controller: ov7670_controller PORT MAP(
+      clk   => clk50,
+      sioc  => ov7670_sioc,
+      resend => resend,
+      config_finished => config_finished,
+      siod  => ov7670_siod,
+      pwdn  => OV7670_PWDN,
+      reset => OV7670_RESET,
+      xclk  => OV7670_XCLK
+   );
+end Behavioral;
+
+debounce.vhd
+----------------------------------------------------------------------------------
+-- Engineer: Mike Field <hamster@snap.net.nz>
+-- 
+-- Description: Convert the push button to a 1PPS that can be used to restart
+--              camera initialisation
+----------------------------------------------------------------------------------
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity debounce is
+    Port ( clk : in  STD_LOGIC;
+           i : in  STD_LOGIC;
+           o : out  STD_LOGIC);
+end debounce;
+
+architecture Behavioral of debounce is
+   signal c : unsigned(23 downto 0);
+begin
+   process(clk)
+   begin
+      if rising_edge(clk) then
+         if i = '1' then
+            if c = x"FFFFFF" then
+               o <= '1';
+            else
+               o <= '0';
+            end if;
+            c <= c+1;
+         else
+            c <= (others => '0');
+            o <= '0';
+         end if;
+      end if;
+   end process;
+end Behavioral;
+
+ov7670_capture.vhd
+----------------------------------------------------------------------------------
+-- Engineer: Mike Field <hamster@snap.net.nz>
+-- 
+-- Description: Captures the pixels coming from the OV760 camera and 
+--              Stores them in block RAM
+----------------------------------------------------------------------------------
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity ov7670_capture is
+    Port ( pclk  : in   STD_LOGIC;
+           vsync : in   STD_LOGIC;
+           href  : in   STD_LOGIC;
+           d     : in   STD_LOGIC_VECTOR (7 downto 0);
+           addr  : out  STD_LOGIC_VECTOR (14 downto 0);
+           dout  : out  STD_LOGIC_VECTOR (7 downto 0);
+           we    : out  STD_LOGIC);
+end ov7670_capture;
+
+architecture Behavioral of ov7670_capture is
+   signal d_latch    : std_logic_vector(7 downto 0)  := (others => '0');
+   signal href_last  : std_logic;
+   signal cnt        : std_logic_vector(1 downto 0)  := (others => '0');
+   signal hold_red   : std_logic_vector(2 downto 0)  := (others => '0');
+   signal hold_green : std_logic_vector(2 downto 0)  := (others => '0');
+   signal address    : STD_LOGIC_VECTOR(14 downto 0) := (others => '0');
+   
+begin
+   addr <= address;
+   process(pclk)
+   begin
+      if rising_edge(pclk) then
+         we   <= '0';
+         if vsync = '1' then 
+            address <= (others => '1');
+            href_last <= '0';
+            cnt <= "00";
+         else       
+            if href_last = '1' and address /= "100101011111111" then
+               if cnt = "11"  then
+                 address <= std_logic_vector(unsigned(address)+1);
+               end if;
+               if cnt = "01" then
+                  we   <='1';
+               end if;
+               cnt <= std_logic_vector(unsigned(cnt)+1);
+            end if;
+         end if;
+         
+         dout <= hold_red & hold_green & d_latch(4 downto 3); -- d(4:3) is blue;         
+
+         hold_green   <= d_latch(7 downto 5);  
+         hold_red <= d_latch(2 downto 0);
+         d_latch <= d;
+         
+         href_last <= href;
+      end if;
+   end process;
+end Behavioral;
+
+ov7670_controller.vhd
+This module joins the I2C transmitter to a memory containing preset values to load into the camera's internal registers.
+----------------------------------------------------------------------------------
+-- Engineer: Mike Field <hamster@snap.net.nz>
+-- 
+-- Description: Controller for the OV760 camera - transferes registers to the 
+--              camera over an I2C like bus
+----------------------------------------------------------------------------------
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity ov7670_controller is
+    Port ( clk   : in    STD_LOGIC;
+           resend :in    STD_LOGIC;
+	      config_finished : out std_logic;
+           sioc  : out   STD_LOGIC;
+           siod  : inout STD_LOGIC;
+           reset : out   STD_LOGIC;
+           pwdn  : out   STD_LOGIC;
+           xclk  : out   STD_LOGIC
+);
+end ov7670_controller;
+
+architecture Behavioral of ov7670_controller is
+   COMPONENT ov7670_registers
+   PORT(
+      clk      : IN std_logic;
+      advance  : IN std_logic;          
+      resend   : in STD_LOGIC;
+      command  : OUT std_logic_vector(15 downto 0);
+      finished : OUT std_logic
+      );
+   END COMPONENT;
+
+   COMPONENT i2c_sender
+   PORT(
+      clk   : IN std_logic;
+      send  : IN std_logic;
+      taken : out std_logic;
+      id    : IN std_logic_vector(7 downto 0);
+      reg   : IN std_logic_vector(7 downto 0);
+      value : IN std_logic_vector(7 downto 0);    
+      siod  : INOUT std_logic;      
+      sioc  : OUT std_logic
+      );
+   END COMPONENT;
+
+   signal sys_clk  : std_logic := '0';   
+   signal command  : std_logic_vector(15 downto 0);
+   signal finished : std_logic := '0';
+   signal taken    : std_logic := '0';
+   signal send     : std_logic;
+
+   constant camera_address : std_logic_vector(7 downto 0) := x"42"; -- 42"; -- Device write ID - see top of page 11 of data sheet
+begin
+   config_finished <= finished;
+   
+   send <= not finished;
+   Inst_i2c_sender: i2c_sender PORT MAP(
+      clk   => clk,
+      taken => taken,
+      siod  => siod,
+      sioc  => sioc,
+      send  => send,
+      id    => camera_address,
+      reg   => command(15 downto 8),
+      value => command(7 downto 0)
+   );
+
+   reset <= '1';                   -- Normal mode
+   pwdn  <= '0';                   -- Power device up
+   xclk  <= sys_clk;
+   
+   Inst_ov7670_registers: ov7670_registers PORT MAP(
+      clk      => clk,
+      advance  => taken,
+      command  => command,
+      finished => finished,
+      resend   => resend
+   );
+
+   process(clk)
+   begin
+      if rising_edge(clk) then
+         sys_clk <= not sys_clk;
+      end if;
+   end process;
+end Behavioral;
+
+ov7670_registers.vhd
+This would most probably be better implemented using a block RAM, but it just an awkward size.
+NOTE: Please look at Zedboard_OV7670 for an updated register set with better colour and contrast
+----------------------------------------------------------------------------------
+-- Company: 
+-- Engineer: Mike Field <hamster@sanp.net.nz> 
+-- 
+-- Description: Register settings for the OV7670 Caamera (partially from OV7670.c
+--              in the Linux Kernel
+------------------------------------------------------------------------------------
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity ov7670_registers is
+    Port ( clk      : in  STD_LOGIC;
+           resend   : in  STD_LOGIC;
+           advance  : in  STD_LOGIC;
+           command  : out  std_logic_vector(15 downto 0);
+           finished : out  STD_LOGIC);
+end ov7670_registers;
+
+architecture Behavioral of ov7670_registers is
+   signal sreg   : std_logic_vector(15 downto 0);
+   signal address : std_logic_vector(7 downto 0) := (others => '0');
+begin
+   command <= sreg;
+   with sreg select finished  <= '1' when x"FFFF", '0' when others;
+   
+   process(clk)
+   begin
+      if rising_edge(clk) then
+         if resend = '1' then 
+            address <= (others => '0');
+         elsif advance = '1' then
+            address <= std_logic_vector(unsigned(address)+1);
+         end if;
+
+         case address is
+            when x"00" => sreg <= x"1280"; -- COM7   Reset
+            when x"01" => sreg <= x"1280"; -- COM7   Reset
+            when x"02" => sreg <= x"1100"; -- CLKRC  Prescaler - Fin/(1+1)
+            when x"03" => sreg <= x"1204"; -- COM7   QIF + RGB output
+            when x"04" => sreg <= x"0C04"; -- COM3  Lots of stuff, enable scaling, all others off
+            when x"05" => sreg <= x"3E19"; -- COM14  PCLK scaling = 0
+            
+             when x"06" => sreg <= x"4010"; -- COM15  Full 0-255 output, RGB 565
+            when x"07" => sreg <= x"3a04"; -- TSLB   Set UV ordering,  do not auto-reset window
+            when x"08" => sreg <= x"8C00"; -- RGB444 Set RGB format
+            
+            when x"09" => sreg <= x"1714"; -- HSTART HREF start (high 8 bits)
+            when x"0a" => sreg <= x"1802"; -- HSTOP  HREF stop (high 8 bits)
+            when x"0b" => sreg <= x"32A4"; -- HREF   Edge offset and low 3 bits of HSTART and HSTOP
+            when x"0c" => sreg <= x"1903"; -- VSTART VSYNC start (high 8 bits)
+            when x"0d" => sreg <= x"1A7b"; -- VSTOP  VSYNC stop (high 8 bits) 
+            when x"0e" => sreg <= x"030a"; -- VREF   VSYNC low two bits
+            
+            when x"0f" => sreg <= x"703a"; -- SCALING_XSC
+            when x"10" => sreg <= x"7135"; -- SCALING_YSC
+            when x"11" => sreg <= x"7211"; -- SCALING_DCWCTR
+            when x"12" => sreg <= x"73f1"; -- SCALING_PCLK_DIV
+            when x"13" => sreg <= x"a202"; -- SCALING_PCLK_DELAY  PCLK scaling = 4, must match COM14
+            
+            when x"14" => sreg <= x"1500"; -- COM10 Use HREF not hSYNC
+            when x"15" => sreg <= x"7a20"; -- SLOP
+            when x"16" => sreg <= x"7b10"; -- GAM1
+            when x"17" => sreg <= x"7c1e"; -- GAM2
+            when x"18" => sreg <= x"7d35"; -- GAM3
+            when x"19" => sreg <= x"7e5a"; -- GAM4
+            when x"1A" => sreg <= x"7f69"; -- GAM5
+            when x"1B" => sreg <= x"8076"; -- GAM6
+            when x"1C" => sreg <= x"8180"; -- GAM7
+            when x"1D" => sreg <= x"8288"; -- GAM8
+            when x"1E" => sreg <= x"838f"; -- GAM9
+            when x"1F" => sreg <= x"8496"; -- GAM10
+            when x"20" => sreg <= x"85a3"; -- GAM11
+            when x"21" => sreg <= x"86af"; -- GAM12
+            when x"22" => sreg <= x"87c4"; -- GAM13
+            when x"23" => sreg <= x"88d7"; -- GAM14
+            when x"24" => sreg <= x"89e8"; -- GAM15
+            when x"25" => sreg <= x"13E0"; -- COM8 - AGC, White balance
+            when x"26" => sreg <= x"0000"; -- GAIN AGC 
+            when x"27" => sreg <= x"1000"; -- AECH Exposure
+            when x"28" => sreg <= x"0D40"; -- COMM4 - Window Size
+            when x"29" => sreg <= x"1418"; -- COMM9 AGC 
+            when x"2a" => sreg <= x"a505"; -- AECGMAX banding filter step
+            when x"2b" => sreg <= x"2495"; -- AEW AGC Stable upper limite
+            when x"2c" => sreg <= x"2533"; -- AEB AGC Stable lower limi
+            when x"2d" => sreg <= x"26e3"; -- VPT AGC fast mode limits
+            when x"2e" => sreg <= x"9f78"; -- HRL High reference level
+            when x"2f" => sreg <= x"A068"; -- LRL low reference level
+            when x"30" => sreg <= x"a103"; -- DSPC3 DSP control
+            when x"31" => sreg <= x"A6d8"; -- LPH Lower Prob High
+            when x"32" => sreg <= x"A7d8"; -- UPL Upper Prob Low
+            when x"33" => sreg <= x"A8f0"; -- TPL Total Prob Low
+            when x"34" => sreg <= x"A990"; -- TPH Total Prob High
+            when x"35" => sreg <= x"AA94"; -- NALG AEC Algo select
+            when x"36" => sreg <= x"13E5"; -- COM8 AGC Settings
+            when others => sreg <= x"ffff";
+         end case;
+      end if;
+   end process;
+end Behavioral;
+
+i2c_sender.vhd
+This module implements an I2C-like protocol used to send register writes out to the camera.
+----------------------------------------------------------------------------------
+-- Engineer: <mfield@concepts.co.nz
+-- 
+-- Description: Send the commands to the OV7670 over an I2C-like interface
+--
+----------------------------------------------------------------------------------
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity i2c_sender is
+    Port ( clk   : in  STD_LOGIC;    
+           siod  : inout  STD_LOGIC;
+           sioc  : out  STD_LOGIC;
+           taken : out  STD_LOGIC;
+           send  : in  STD_LOGIC;
+           id    : in  STD_LOGIC_VECTOR (7 downto 0);
+           reg   : in  STD_LOGIC_VECTOR (7 downto 0);
+           value : in  STD_LOGIC_VECTOR (7 downto 0));
+end i2c_sender;
+
+architecture Behavioral of i2c_sender is
+   signal   divider  : unsigned (7 downto 0) := "00000001"; -- this value gives a 254 cycle pause before the initial frame is sent
+   signal   busy_sr  : std_logic_vector(31 downto 0) := (others => '0');
+   signal   data_sr  : std_logic_vector(31 downto 0) := (others => '1');
+begin
+   process(busy_sr, data_sr(31))
+   begin
+      if busy_sr(11 downto 10) = "10" or 
+         busy_sr(20 downto 19) = "10" or 
+         busy_sr(29 downto 28) = "10"  then
+         siod <= 'Z';
+      else
+         siod <= data_sr(31);
+      end if;
+   end process;
+   
+   process(clk)
+   begin
+      if rising_edge(clk) then
+         taken <= '0';
+         if busy_sr(31) = '0' then
+            SIOC <= '1';
+            if send = '1' then
+               if divider = "00000000" then
+                  data_sr <= "100" &   id & '0'  &   reg & '0' & value & '0' & "01";
+                  busy_sr <= "111" & "111111111" & "111111111" & "111111111" & "11";
+                  taken <= '1';
+               else
+                  divider <= divider+1; -- this only happens on powerup
+               end if;
+            end if;
+         else
+
+            case busy_sr(32-1 downto 32-3) & busy_sr(2 downto 0) is
+               when "111"&"111" => -- start seq #1
+                  case divider(7 downto 6) is
+                     when "00"   => SIOC <= '1';
+                     when "01"   => SIOC <= '1';
+                     when "10"   => SIOC <= '1';
+                     when others => SIOC <= '1';
+                  end case;
+               when "111"&"110" => -- start seq #2
+                  case divider(7 downto 6) is
+                     when "00"   => SIOC <= '1';
+                     when "01"   => SIOC <= '1';
+                     when "10"   => SIOC <= '1';
+                     when others => SIOC <= '1';
+                  end case;
+               when "111"&"100" => -- start seq #3
+                  case divider(7 downto 6) is
+                     when "00"   => SIOC <= '0';
+                     when "01"   => SIOC <= '0';
+                     when "10"   => SIOC <= '0';
+                     when others => SIOC <= '0';
+                  end case;
+               when "110"&"000" => -- end seq #1
+                  case divider(7 downto 6) is
+                     when "00"   => SIOC <= '0';
+                     when "01"   => SIOC <= '1';
+                     when "10"   => SIOC <= '1';
+                     when others => SIOC <= '1';
+                  end case;
+               when "100"&"000" => -- end seq #2
+                  case divider(7 downto 6) is
+                     when "00"   => SIOC <= '1';
+                     when "01"   => SIOC <= '1';
+                     when "10"   => SIOC <= '1';
+                     when others => SIOC <= '1';
+                  end case;
+               when "000"&"000" => -- Idle
+                  case divider(7 downto 6) is
+                     when "00"   => SIOC <= '1';
+                     when "01"   => SIOC <= '1';
+                     when "10"   => SIOC <= '1';
+                     when others => SIOC <= '1';
+                  end case;
+               when others      => 
+                  case divider(7 downto 6) is
+                     when "00"   => SIOC <= '0';
+                     when "01"   => SIOC <= '1';
+                     when "10"   => SIOC <= '1';
+                     when others => SIOC <= '0';
+                  end case;
+            end case;   
+
+            if divider = "11111111" then
+               busy_sr <= busy_sr(32-2 downto 0) & '0';
+               data_sr <= data_sr(32-2 downto 0) & '1';
+               divider <= (others => '0');
+            else
+               divider <= divider+1;
+            end if;
+         end if;
+      end if;
+   end process;
+end Behavioral;
+
+vga.vhd
+----------------------------------------------------------------------------------
+-- Engineer: Mike Field <hamster@snap.net.nz>
+-- 
+-- Description: Generate analog 800x600 VGA, double-doublescanned from 19200 bytes of RAM
+--
+----------------------------------------------------------------------------------
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity vga is
+    Port ( 
+      clk50       : in  STD_LOGIC;
+      vga_red     : out STD_LOGIC_VECTOR(2 downto 0);
+      vga_green   : out STD_LOGIC_VECTOR(2 downto 0);
+      vga_blue    : out STD_LOGIC_VECTOR(2 downto 1);
+      vga_hsync   : out STD_LOGIC;
+      vga_vsync   : out STD_LOGIC;
+      frame_addr  : out STD_LOGIC_VECTOR(14 downto 0);
+      frame_pixel : in  STD_LOGIC_VECTOR(7 downto 0)
+    );
+end vga;
+
+architecture Behavioral of vga is
+   -- Timing constants
+   constant hRez       : natural := 800;
+   constant vRez       : natural := 600;
+
+   constant hMaxCount  : natural := 1056;
+   constant hStartSync : natural := 840;
+   constant hEndSync   : natural := 968;
+   constant vMaxCount  : natural := 628;
+   constant vStartSync : natural := 601;
+   constant vEndSync   : natural := 605;
+   constant hsync_active : std_logic := '1';
+   constant vsync_active : std_logic := '1';
+
+   signal hCounter : unsigned(10 downto 0) := (others => '0');
+   signal vCounter : unsigned(9 downto 0) := (others => '0');
+   signal address : unsigned(16 downto 0) := (others => '0');
+   signal blank : std_logic := '1';
+
+begin
+   frame_addr <= std_logic_vector(address(16 downto 2));
+   
+   process(clk50)
+   begin
+      if rising_edge(clk50) then
+         -- Count the lines and rows      
+         if hCounter = hMaxCount-1 then
+            hCounter <= (others => '0');
+            if vCounter = vMaxCount-1 then
+               vCounter <= (others => '0');
+            else
+               vCounter <= vCounter+1;
+            end if;
+         else
+            hCounter <= hCounter+1;
+         end if;
+
+         if blank = '0' then
+            vga_red   <= frame_pixel(7 downto 5);
+            vga_green <= frame_pixel(4 downto 2);
+            vga_blue  <= frame_pixel(1 downto 0);
+         else
+            vga_red   <= (others => '0');
+            vga_green <= (others => '0');
+            vga_blue  <= (others => '0');
+         end if;
+   
+         if vCounter  >= vRez then
+            address <= (others => '0');
+            blank <= '1';
+         else 
+            if hCounter  >= 80 and hCounter  < 720 then
+               blank <= '0';
+               if hCounter = 719 then
+                  if vCounter(1 downto 0) /= "11" then
+                     address <= address - 639;
+                  else
+                      address <= address+1;
+                  end if;
+               else
+                  address <= address+1;
+               end if;
+            else
+               blank <= '1';
+            end if;
+         end if;
+   
+         -- Are we in the hSync pulse? (one has been added to include frame_buffer_latency)
+         if hCounter > hStartSync and hCounter <= hEndSync then
+            vga_hSync <= hsync_active;
+         else
+            vga_hSync <= not hsync_active;
+         end if;
+
+         -- Are we in the vSync pulse?
+         if vCounter >= vStartSync and vCounter < vEndSync then
+            vga_vSync <= vsync_active;
+         else
+            vga_vSync <= not vsync_active;
+         end if;
+      end if;
+   end process;
+end Behavioral;
+
+nexys2.ucf
+NET "clk50" TNM_NET = clk50;
+TIMESPEC TS_clk50 = PERIOD "clk50" 20 ns HIGH 50%;
+NET "clk50"   LOC = "B8"; # Bank = 0, Pin name = IP_L13P_0/GCLK8, Type = GCLK, Sch name = GCLK0
+
+NET "OV7670_PWDN"  LOC = "L15" | IOSTANDARD=LVTTL | SLEW=SLOW; # JA0
+NET "OV7670_RESET" LOC = "K13" | IOSTANDARD=LVTTL | SLEW=SLOW; # JA4
+NET "OV7670_D<0>"  LOC = "K12" | IOSTANDARD=LVTTL | SLEW=SLOW; # JA1
+NET "OV7670_D<1>"  LOC = "L16" | IOSTANDARD=LVTTL | SLEW=SLOW; # JA5
+NET "OV7670_D<2>"  LOC = "L17" | IOSTANDARD=LVTTL | SLEW=SLOW; # JA2
+NET "OV7670_D<3>"  LOC = "M14" | IOSTANDARD=LVTTL | SLEW=SLOW; # JA6
+NET "OV7670_D<4>"  LOC = "M15" | IOSTANDARD=LVTTL | SLEW=SLOW; # JA3
+NET "OV7670_D<5>"  LOC = "M16" | IOSTANDARD=LVTTL | SLEW=SLOW; # JA7
+NET "OV7670_D<6>"  LOC = "M13" | IOSTANDARD=LVTTL | SLEW=SLOW; # JB0
+NET "OV7670_D<7>"  LOC = "P17" | IOSTANDARD=LVTTL | SLEW=SLOW; # JB4
+NET "OV7670_XCLK"  LOC = "R18" | IOSTANDARD=LVTTL | SLEW=SLOW; # JB1
+NET "OV7670_PCLK"  LOC = "R16" | IOSTANDARD=LVTTL | SLEW=SLOW; # JB5
+NET "OV7670_HREF"  LOC = "R15" | IOSTANDARD=LVTTL | SLEW=SLOW; # JB2
+NET "OV7670_VSYNC" LOC = "T18" | IOSTANDARD=LVTTL | SLEW=SLOW; # JB6
+NET "OV7670_SIOD"  LOC = "T17" | IOSTANDARD=LVTTL | SLEW=SLOW | PULLUP; # JB3
+NET "OV7670_SIOC"  LOC = "U18" | IOSTANDARD=LVTTL | SLEW=SLOW; # JB7
+NET "OV7670_PCLK" CLOCK_DEDICATED_ROUTE = FALSE;
+
+NET "Led<0>"  LOC = "J14" | IOSTANDARD=LVTTL ; 
+NET "Led<1>"  LOC = "J15" | IOSTANDARD=LVTTL ; 
+NET "Led<2>"  LOC = "K15" | IOSTANDARD=LVTTL ; 
+NET "Led<3>"  LOC = "K14" | IOSTANDARD=LVTTL ; 
+NET "Led<4>"  LOC = "E17" | IOSTANDARD=LVTTL ; 
+NET "Led<5>"  LOC = "P15" | IOSTANDARD=LVTTL ; 
+NET "Led<6>"  LOC = "F4"  | IOSTANDARD=LVTTL ;  
+NET "Led<7>"  LOC = "R4"  | IOSTANDARD=LVTTL ;  
+
+NET "vga_Red<0>"   LOC = "R9";
+NET "vga_Red<1>"   LOC = "T8";
+NET "vga_Red<2>"   LOC = "R8";
+NET "vga_Green<0>" LOC = "N8";
+NET "vga_Green<1>" LOC = "P8";
+NET "vga_Green<2>" LOC = "P6";
+NET "vga_Blue<1>"  LOC = "U5";
+NET "vga_Blue<2>"  LOC = "U4";
+NET "vga_Hsync"    LOC = "T4";
+NET "vga_Vsync"    LOC = "U3";
+
+NET "btn" LOC = "B18";
+
+ov7670_capture.vhd - Version 2.0
+And here is version 2.0. It captures the signals on the falling edge of the clock. It might get better results for you Please note that this version is set up to capture at 160x120 -- it is not a drop in replacement for the code above.
+----------------------------------------------------------------------------------
+-- Engineer: Mike Field <hamster@snap.net.nz>
+-- 
+-- Description: Captures the pixels coming from the OV7670 camera and 
+--              Stores them in block RAM
+--
+-- The length of href last controls how often pixels are captive - (2 downto 0) stores
+-- one pixel every 4 cycles.
+--
+-- "line" is used to control how often data is captured. In this case every fourth 
+-- line
+----------------------------------------------------------------------------------
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity ov7670_capture is
+    Port ( pclk  : in   STD_LOGIC;
+           vsync : in   STD_LOGIC;
+           href  : in   STD_LOGIC;
+           d     : in   STD_LOGIC_VECTOR (7 downto 0);
+           addr  : out  STD_LOGIC_VECTOR (18 downto 0);
+           dout  : out  STD_LOGIC_VECTOR (11 downto 0);
+           we    : out  STD_LOGIC);
+end ov7670_capture;
+
+architecture Behavioral of ov7670_capture is
+   signal d_latch      : std_logic_vector(15 downto 0) := (others => '0');
+   signal address      : STD_LOGIC_VECTOR(18 downto 0) := (others => '0');
+   signal line         : std_logic_vector(1 downto 0)  := (others => '0');
+   signal href_last    : std_logic_vector(6 downto 0)  := (others => '0');
+   signal we_reg       : std_logic := '0';
+   signal href_hold    : std_logic := '0';
+   signal latched_vsync : STD_LOGIC := '0';
+   signal latched_href  : STD_LOGIC := '0';
+   signal latched_d     : STD_LOGIC_VECTOR (7 downto 0) := (others => '0');
+begin
+   addr <= address;
+   we <= we_reg;
+   dout    <= d_latch(15 downto 12) & d_latch(10 downto 7) & d_latch(4 downto 1); 
+   
+capture_process: process(pclk)
+   begin
+      if rising_edge(pclk) then
+         if we_reg = '1' then
+            address <= std_logic_vector(unsigned(address)+1);
+         end if;
+
+         -- This is a bit tricky href starts a pixel transfer that takes 3 cycles
+         --        Input   | state after clock tick   
+         --         href   | wr_hold    d_latch           dout                we address  address_next
+         -- cycle -1  x    |    xx      xxxxxxxxxxxxxxxx  xxxxxxxxxxxx  x   xxxx     xxxx
+         -- cycle 0   1    |    x1      xxxxxxxxRRRRRGGG  xxxxxxxxxxxx  x   xxxx     addr
+         -- cycle 1   0    |    10      RRRRRGGGGGGBBBBB  xxxxxxxxxxxx  x   addr     addr
+         -- cycle 2   x    |    0x      GGGBBBBBxxxxxxxx  RRRRGGGGBBBB  1   addr     addr+1
+
+         -- detect the rising edge on href - the start of the scan line
+         if href_hold = '0' and latched_href = '1' then
+            case line is
+               when "00"   => line <= "01";
+               when "01"   => line <= "10";
+               when "10"   => line <= "11";
+               when others => line <= "00";
+            end case;
+         end if;
+         href_hold <= latched_href;
+         
+         -- capturing the data from the camera, 12-bit RGB
+         if latched_href = '1' then
+            d_latch <= d_latch( 7 downto 0) & latched_d;
+         end if;
+         we_reg  <= '0';
+
+         -- Is a new screen about to start (i.e. we have to restart capturing
+         if latched_vsync = '1' then 
+            address      <= (others => '0');
+            href_last    <= (others => '0');
+            line         <= (others => '0');
+         else
+            -- If not, set the write enable whenever we need to capture a pixel
+            if href_last(href_last'high) = '1' then
+               if line = "10" then
+                  we_reg <= '1';
+               end if;
+               href_last <= (others => '0');
+            else
+               href_last <= href_last(href_last'high-1 downto 0) & latched_href;
+            end if;
+         end if;
+      end if;
+      if falling_edge(pclk) then
+         latched_d     <= d;
+         latched_href  <= href;
+         latched_vsync <= vsync;
+      end if;
+   end process;
+end Behavioral;
+
+
+
+
+
+
+
+
+
+
+
+http://hamsterworks.co.nz/mediawiki/index.php/FPGA_Projects
+FPGA Projects
+Projects I've been playing with that use Field Programmable Gate Arrays, and their status
+Sorry for the slow updates - life is getting in the way of my hobbies, but I am working on a big project...
+Project	Description	Status
+Simple AXI Slave	An AXI slave for Zynq's ARM CPUs	Completed
+myStorm Blackice	First project with an Open Source FPGA toolset	Completed
+TinyTx	Making a really tiny serial TX	Completed
+GigabitTX	Sending data from a 10/100/1000 Ethernet Port	Completed
+ArtyEthernet	Sending data on the Digilent Arty's 10/100 Ethernet Port	Completed
+Morse	Transmit Morse code with the Arty	Completed
+Synchronizer	The right way to synchronize an input signal	Completed
+MIC and AMP	Adding a Microphone to the PMODamp3 design	Completed
+PMODamp3	Driving an Class D I2S power amp module	Completed
+Virtual IO	Using the Vivado Debug Virtual IP	Completed
+MPU6050 sensor RTL	Using a Gyro / Acceleration / Attitude sensor directly in RTL	Completed
+Single Step	A way to allow switching to a single-step clock in Spartan 6	Completed
+XADC Fan PWM	Using the 7-series XADC to control fan speed	Completed
+Minimal XADC design	Reading an input from the on-FPGA ADX on the Basys3	Completed
+Better rotary encoder input	My early attempt at quadrature decoding wasn't that good	Completed
+Genesys2 Mandelbrot	Port of the Artix-7 Fractal viewer to the Kintex-7 on the Genesys2	Completed
+DisplayPort	A DisplayPort interface	Completed
+HDMI Capture	Capturing HDMI data and sending it to the serial port	Completed
+HDMI Processing	HDMI Video and Audio extraction on an Artix 7 board	Completed
+EDID ROM	An basic EDID for a video project	Completed
+SERDES symbol locking	How to find a working bitslip / input delay setting for 7-series ISERDES	Completed
+Artix 7 1080p passthrough	Passing HDMI signals through the Nexys Video	Completed
+Square root	Calculating the integer square root of a number	Completed
+Artix 7 1080p	Seeing if the Artix-7 can generate 1080p, with a little over-clocking	Completed
+Mandelbrot NG 1080i	A full-HD on the fly Mandelbrot Fractal viewer for the Nexys Video	Completed
+GPS Spew	A desktop GPS jammer	Completed
+OSERDESE2	An example 10:1 serialiser that simulates properly	Completed
+Digital Microphone	Getting data from a PmodMIC3 - A MEM Smicrophone and 12-bit ADC	Completed
+Mandelbrot NG	A new real time Mandelbrot viewer	Completed
+Ring Oscillator	Creating a ring oscillator in an FPGA	Completed
+Digital Sine	Creating relatively accurate analog sine waves with an DAC	Completed
+PmodAD1	Reading an analog joystick with the PmodAD1 (Analog Devices AD7476 ADC)	Completed
+FPGA_ESP8266	Interfacing your FPGA to wifi using low cost ESP8266 module	Completed
+PmodMAXSONAR	Using the serial interface on the PmodMAXSONAR module	Completed
+Minimal HDMI	A super-light-weight 3 bits per pixel true HDMI interface	Completed
+Minimal DVI-D	A super-light-weight 9 bits per pixel DVI-D interface	Completed
+Log Pins	A tiny project to send the start of 11 pins to a host over RS232	Completed
+miniSpartan6+ SPI Programming	Writing your logic design into the board's SPI configuration FLASH	Completed
+miniSpartan6+ DVID Logo	Overlaying the Hamsterworks Logo on a DVI-D stream	Completed
+miniSpartan6+ Audio	Playing beeps	In progress
+miniSpartan6+ DVID Output	A better DVI-D output for the Scarab Hardware miniSpartan6+ board	Completed
+miniSpartan6+ bringup	First bringup of the Scarab Hardware miniSpartan6+ board	Completed
+Stepper	Controlling a small stepper motor	Completed
+Math free digital clock	A digital clock that doesn't know how to add!	Completed
+LFSR Divider	Using a LFSR to divide a clock signal	Completed
+Sonar	Interfacing a low-cost sonar module to an FPGA	Completed
+Simple resets don't work	Showing how not to implement a reset	Completed
+DDS via a VGA port	Analysing how well a VGA port can generate a 6.25 MHz frequency sine wave	Completed
+Inferred FIFO	Implementing a FIFO to avoid using IP	Completed
+Cheap Analogue Input	Reading an analogue joystick without a ADC	Completed
+HDMI Input	Receiving high-speed digital video (DVI-D over HDMI)	Completed
+Intelligent LEDs	Driving Intelligent LEDs	Completed
+SDRAM Audio playback	Playing back extended audio from SDRAM	Completed
+FPGA wheelchair fairy lights	LED lights for my boy's wheelchair	Completed
+Accessing the configuration clock	Using the internal oscillator	Completed
+High Speed Frequency Counter	Counting the fastest of clocks	Completed
+DVI-D Serdes	Creating a DVI-D signal using the OSERDES2 Serializers	Completed
+SD card testing	Playing around with the SPI interface on an SD card	Completed
+Logic Analyser Test	An 8-bit 200MHz counter to test a Logic Analyser	Completed
+Eternity2 Solver	Using an FPGA to solve the Eternity II puzzle	Completed
+Zedboard Audio	Using the I2S Audio codec on the Zedboard from VHDL	Completed
+Reflow Oven	Solder reflow using an benchtop oven and a FPGA	Completed
+FIR Filter	Implementing a FIR filter in an FPGA	Completed
+Solid State Relay	Driving a SSR from the a FPGA	Completed
+Analog Wing	Using the Papilio Analogue Wing	Completed
+Thermocouple demo	Capturing data using a Adafruit Thermocouple interface	Completed
+Simple SDRAM Controller	A very simple SDRAM controller	Completed
+Zedboard_VGA_HDMI	Driving the Zedboard's VGA and HDMI interface, at one clock per Pixel
+Includes RGB444 to YCbCr conversion
+Completed
+Zedboard_HDMI_v2	Driving the Zedboard's HDMI interface	Completed
+pmodi2s	Driving a Digilent PMODI2S Audio DAC	Completed
+pmodenc	Decoding the input from the Digitent PMODENC rotary encoder	Completed
+mains_hum_filter	A low-pass DSP filter removing 50Hz hum from an ADC's samples	Completed
+a2d_graph	Slowly graphing channel 0 on the LogicStart's ADC	Completed
+DSP_Filter_Design	Various bits and bobs for FIR filter design	Completed
+I3C2	An Intelligent I2C Controller	Completed
+Audio filter	Simulating a passive analogue audio filter	Planning
+Dualhead MCB Frame Buffer	Adding a DVI-D output to the MCB Frame Buffer	Completed
+MCB Frame Buffer	Creating a 720p frame buffer in the Pipistrello's LPDDR memory	Completed
+USB TTL RS232	Using the Papilio as a TTL RS232 adapter	Completed
+Spartan 6 1080p	Generating 1080p on a Spartan 6 LX	Completed
+High Speed Link	High speed transfer between two FPGAs	Completed
+RS232_dumper	Capture then dump data to the RS232 port	Completed
+Zedboard_HDMI	Driving the Zedboard's HDMI interface	In Development
+Zedboard_OV7670	Attaching a low cost camera to the Zedboard	Completed
+Async_VGA	A VGA Controller that works with bursts of data (e.g. from SDRAM)	Completed
+FreqSwitch	CHanging a DCM_CLKGEN's output "on the fly" to generate different frequencies	Completed
+FM_SOS	Send SOS with a simple FM transmitter	Completed
+OV7670_camera	Video capture from a cheap camera module	Completed
+Digilent EPP Performance	Performance difference in the EPP port speed on digilent boards	Completed
+OSERDES2 clocking	Setting up the clocking infrastructure for high speed serial output	Untested
+frequency_counter	GPS referenced frequency counter	Completed
+hidef_snow	Generate static in 1080p	Completed
+config_flash	Storing arbitrary data in the configuration flash	Completed
+async_reset	Testing async reset reliability	Completed
+meta_test	Testing for metastability	Completed
+if vs case	Testing different implementations	Completed
+ray_cast	A "ray casting" 3D maze walk through	In Progress
+dx_display	Driving a Deal Extreme TM1638 7 Seg Display	Completed
+Synth	A simple all-digital Synth, in bite sized parts	Partially complete
+Crystal Castles	Reimplementing the old arcade machine on an FPGA	In progress
+CheapScope	A simple fabric embedded logic analyser, with and RS232 interface	Completed
+dvid_test	Driving a DVI-D interface from a Spartan 6 FPGA	Completed
+HDlife	Implementing Conway's Game of Life at full HD	Completed
+FPGAheli	Controlling an Infrared Helicopter	Completed
+shortwave	A very quick and dirty shortwave transmitter	Completed
+AVR8 core	An AVR103 nearly compatible soft core originally from OpenCores	Running, but no documentation yet.
+10BaseT-TX	Sending out Ethernet packets directly from the FPGA	Completed
+SPDIF_Input	Capturing and converting digital audio data from DVD players	Completed
+SPDIF_out	Generating digital audio data output	Completed
+SPDIF_Volume	A simple digital volume control for a S/PDIF signal - a very simple DSP	Completed
+SPDIF_Thru	A passthrough for S/PDIF singal - a base for DSP projects	Completed
+VGA Display	Generating the timings for 1440x900 VGA output	Completed
+WavePlay	Playing 8bit stereo audio samples from Block RAM	Completed
+Mandelbrot	Yet another FPGA Mandelbrot viewer	Completed
+DSPfract	Yet another FPGA Mandelbrot viewer - this time using Spartan 6 DSP48A bocks	Completed
+Radix2div	Radix 2 division in VHDL	Completed
+Radix4div	Radix 4 division in VHDL	Abandoned
+SDRAM Memory Controller	Memory controller for the SDRAM chip on the Terasic DE0-nano	Design complete, implementation mostly complete. Testing to start.
+uClinux	Bringing up uClinux on a Terasic DE0-nano board	Completed
+MAF6502	A FPGA implementation of the classic MOS6502 processor	On hold
+Papilio Plus/Pacman	Building the Pacman implementation from http://fpgaarcade.com on the Spartan 6 hardware	Completed
+Papilio Plus/Fading counter	A softly fading binary counter	Completed
+Papilio Plus/PS2 Keyboard	Using the PS/2 keyboard interface	Completed
+Papilio Plus/SRAM test 2	writes and verifies test patterns in the SRAM on the Papilio Plus @ 100MHz	Completed
+CUGA-1	A CPU Using Gate Arrays	On hold
+There is also a whole lot of mini projects on the Papilio Plus page, for testing interfaces.
+Unless any of the source files from this site contains headers that indicate otherwise (e.g.in 'CoreGen' components), all of this code is released under the BSD/MIT http://opensource.org/licenses/MIT - Feel free to do anything you want with it.
+If you would like this disclaimer added to any particular file then please let me know and I will add it for you.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
