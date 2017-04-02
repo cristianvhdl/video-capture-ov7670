@@ -1,0 +1,570 @@
+
+
+https://lauri.xn--vsandi-pxa.com/hdl/zynq/xilinx-video-capture.html
+
+Video capture with VDMA
+
+Introduction
+The S2MM portion of Video DMA component can be used for video capture.
+
+Camera input
+Convert to
+AXI4-Stream
+Video
+DDR memory
+AXI4-Stream to
+Video Out v3.0
+Video output
+(VGA, HDMI, etc)
+Clocking
+Wizard
+Video Timing
+Controller v6.1
+AXI Video Direct
+Memory Access
+v6.2
+C code running on ARM cores
+VHDL code running on programmable fabric
+I²S controller
+block
+Camera control
+interface
+AXI4-Stream
+Broadcaster v1.1
+Video4Linux2
+kernel module
+Video4Linux2
+userspace
+application
+AX4-Stream
+Subset
+Converter v1.1
+Ideal pipeline for video capture employing single VDMA instance with only write channel, read channel is disabled.
+
+Minimal hardware design
+As getting everything working at the first attempt is tricky it makes sense to substitute actual camera with test pattern generator and kernel module with a userspace snippet which triggers the DMA transfer.
+
+high-level-design/axi-tpg-via-vdma.png
+High level block design for transferring frames from Test Pattern Generator to DDR memory using S2MM portion of single VDMA instance.
+
+Note that in this case there are two clock domains: AXI4-Lite slaves are communicating at 100MHz bus speed, but video signals are transferred at bus frequency of 150MHz. High speed port clock is highlighted with yellow so if you get errors regarding clock domains double check the clock signal routing.
+
+img/axi-vdma-s2mm-address-editor.png
+Address mapping with AXI Video Direct Memory Access and AXI Test Pattern Generator
+
+In this case VDMA controller control and status registers are mapped at 0x43000000 using AXI-Lite and that memory address can be written to in order to initiate a DMA transfer. In this example MM2S portion is disabled and S2MM portion of the VDMA controller has access to the whole physical memory range of 512MB on ZYBO via AXI High Performance port. This also bears potential security risk as malicious or buggy FPGA bitstream could make it possible to transmit sensitive DDR memory contents for instance RSA keys to third parties.
+
+Note that without kernel module approach Linux may allocate the DMA memory ranges to applications and that combination may end up with memory corruption. In order to avoid that mem=224M should be added to kernel boot arguments so kernel would not use last 32MB for other processes and threads. Better solution would be of course to implement kernel module which ioremaps DMA memory ranges aswell as control/status register memory ranges.
+
+img/axi-tpg-parameters.png
+Test pattern generator [1] is configured to output AXI4-Stream of 24-bit RGB pixels at resolution of 640x480
+
+Such configuration should produce tartan bars pattern.
+
+img/axi-tpg-tartan-bars.png
+Tartan bars pattern
+
+img/axi-vdma-parameters-1.png
+Only write channel (stream to memory-mapped) is enabled
+
+img/axi-vdma-parameters-2.png
+s2mm tuser signal emitted by test pattern generator [1] is used for frame synchronization
+
+[1]	(1, 2) Test Pattern Generator v6.0
+Minimal software design
+Following example for managing triple-buffered VDMA component should be pretty explainatory. Code is roughtly based on Ales Ruda's work [2] with heavy modifications based on Xilinx reference manual:
+
+/*
+ * Triple buffering example for Xilinx VDMA v6.2 IP-core,
+ * loosely based on Ales Ruda's work.
+ *
+ *  Created on: 17.3.2013
+ *      Author: Ales Ruda
+ *         web: www.arbot.cz
+ *
+ *  Modified on: 18.12.2014
+ *       Author: Lauri Vosandi
+ *          web: lauri.vosandi.com
+ */
+
+#include <stdio.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+
+/* Register offsets */
+#define OFFSET_PARK_PTR_REG                     0x28
+#define OFFSET_VERSION                          0x2c
+
+#define OFFSET_VDMA_MM2S_CONTROL_REGISTER       0x00
+#define OFFSET_VDMA_MM2S_STATUS_REGISTER        0x04
+#define OFFSET_VDMA_MM2S_VSIZE                  0x50
+#define OFFSET_VDMA_MM2S_HSIZE                  0x54
+#define OFFSET_VDMA_MM2S_FRMDLY_STRIDE          0x58
+#define OFFSET_VDMA_MM2S_FRAMEBUFFER1           0x5c
+#define OFFSET_VDMA_MM2S_FRAMEBUFFER2           0x60
+#define OFFSET_VDMA_MM2S_FRAMEBUFFER3           0x64
+#define OFFSET_VDMA_MM2S_FRAMEBUFFER4           0x68
+
+#define OFFSET_VDMA_S2MM_CONTROL_REGISTER       0x30
+#define OFFSET_VDMA_S2MM_STATUS_REGISTER        0x34
+#define OFFSET_VDMA_S2MM_IRQ_MASK               0x3c
+#define OFFSET_VDMA_S2MM_REG_INDEX              0x44
+#define OFFSET_VDMA_S2MM_VSIZE                  0xa0
+#define OFFSET_VDMA_S2MM_HSIZE                  0xa4
+#define OFFSET_VDMA_S2MM_FRMDLY_STRIDE          0xa8
+#define OFFSET_VDMA_S2MM_FRAMEBUFFER1           0xac
+#define OFFSET_VDMA_S2MM_FRAMEBUFFER2           0xb0
+#define OFFSET_VDMA_S2MM_FRAMEBUFFER3           0xb4
+#define OFFSET_VDMA_S2MM_FRAMEBUFFER4           0xb8
+
+/* S2MM and MM2S control register flags */
+#define VDMA_CONTROL_REGISTER_START                     0x00000001
+#define VDMA_CONTROL_REGISTER_CIRCULAR_PARK             0x00000002
+#define VDMA_CONTROL_REGISTER_RESET                     0x00000004
+#define VDMA_CONTROL_REGISTER_GENLOCK_ENABLE            0x00000008
+#define VDMA_CONTROL_REGISTER_FrameCntEn                0x00000010
+#define VDMA_CONTROL_REGISTER_INTERNAL_GENLOCK          0x00000080
+#define VDMA_CONTROL_REGISTER_WrPntr                    0x00000f00
+#define VDMA_CONTROL_REGISTER_FrmCtn_IrqEn              0x00001000
+#define VDMA_CONTROL_REGISTER_DlyCnt_IrqEn              0x00002000
+#define VDMA_CONTROL_REGISTER_ERR_IrqEn                 0x00004000
+#define VDMA_CONTROL_REGISTER_Repeat_En                 0x00008000
+#define VDMA_CONTROL_REGISTER_InterruptFrameCount       0x00ff0000
+#define VDMA_CONTROL_REGISTER_IRQDelayCount             0xff000000
+
+/* S2MM status register */
+#define VDMA_STATUS_REGISTER_HALTED                     0x00000001  // Read-only
+#define VDMA_STATUS_REGISTER_VDMAInternalError          0x00000010  // Read or write-clear
+#define VDMA_STATUS_REGISTER_VDMASlaveError             0x00000020  // Read-only
+#define VDMA_STATUS_REGISTER_VDMADecodeError            0x00000040  // Read-only
+#define VDMA_STATUS_REGISTER_StartOfFrameEarlyError     0x00000080  // Read-only
+#define VDMA_STATUS_REGISTER_EndOfLineEarlyError        0x00000100  // Read-only
+#define VDMA_STATUS_REGISTER_StartOfFrameLateError      0x00000800  // Read-only
+#define VDMA_STATUS_REGISTER_FrameCountInterrupt        0x00001000  // Read-only
+#define VDMA_STATUS_REGISTER_DelayCountInterrupt        0x00002000  // Read-only
+#define VDMA_STATUS_REGISTER_ErrorInterrupt             0x00004000  // Read-only
+#define VDMA_STATUS_REGISTER_EndOfLineLateError         0x00008000  // Read-only
+#define VDMA_STATUS_REGISTER_FrameCount                 0x00ff0000  // Read-only
+#define VDMA_STATUS_REGISTER_DelayCount                 0xff000000  // Read-only
+
+typedef struct {
+    unsigned int baseAddr;
+    int vdmaHandler;
+    int width;
+    int height;
+    int pixelLength;
+    int fbLength;
+    unsigned int* vdmaVirtualAddress;
+    unsigned char* fb1VirtualAddress;
+    unsigned char* fb1PhysicalAddress;
+    unsigned char* fb2VirtualAddress;
+    unsigned char* fb2PhysicalAddress;
+    unsigned char* fb3VirtualAddress;
+    unsigned char* fb3PhysicalAddress;
+
+    pthread_mutex_t lock;
+} vdma_handle;
+
+
+
+int vdma_setup(vdma_handle *handle, unsigned int baseAddr, int width, int height, int pixelLength, unsigned int fb1Addr, unsigned int fb2Addr, unsigned int fb3Addr) {
+    handle->baseAddr=baseAddr;
+    handle->width=width;
+    handle->height=height;
+    handle->pixelLength=pixelLength;
+    handle->fbLength=pixelLength*width*height;
+    handle->vdmaHandler = open("/dev/mem", O_RDWR | O_SYNC);
+    handle->vdmaVirtualAddress = (unsigned int*)mmap(NULL, 65535, PROT_READ | PROT_WRITE, MAP_SHARED, handle->vdmaHandler, (off_t)handle->baseAddr);
+    if(handle->vdmaVirtualAddress == MAP_FAILED) {
+        perror("vdmaVirtualAddress mapping for absolute memory access failed.\n");
+        return -1;
+    }
+
+    handle->fb1PhysicalAddress = fb1Addr;
+    handle->fb1VirtualAddress = (unsigned char*)mmap(NULL, handle->fbLength, PROT_READ | PROT_WRITE, MAP_SHARED, handle->vdmaHandler, (off_t)fb1Addr);
+    if(handle->fb1VirtualAddress == MAP_FAILED) {
+        perror("fb1VirtualAddress mapping for absolute memory access failed.\n");
+        return -2;
+    }
+
+    handle->fb2PhysicalAddress = fb2Addr;
+    handle->fb2VirtualAddress = (unsigned char*)mmap(NULL, handle->fbLength, PROT_READ | PROT_WRITE, MAP_SHARED, handle->vdmaHandler, (off_t)fb2Addr);
+    if(handle->fb2VirtualAddress == MAP_FAILED) {
+        perror("fb2VirtualAddress mapping for absolute memory access failed.\n");
+        return -3;
+    }
+
+    handle->fb3PhysicalAddress = fb3Addr;
+    handle->fb3VirtualAddress = (unsigned char*)mmap(NULL, handle->fbLength, PROT_READ | PROT_WRITE, MAP_SHARED, handle->vdmaHandler, (off_t)fb3Addr);
+    if(handle->fb3VirtualAddress == MAP_FAILED)
+    {
+     perror("fb3VirtualAddress mapping for absolute memory access failed.\n");
+     return -3;
+    }
+
+    memset(handle->fb1VirtualAddress, 255, handle->width*handle->height*handle->pixelLength);
+    memset(handle->fb2VirtualAddress, 255, handle->width*handle->height*handle->pixelLength);
+    memset(handle->fb3VirtualAddress, 255, handle->width*handle->height*handle->pixelLength);
+    return 0;
+}
+
+
+void vdma_halt(vdma_handle *handle) {
+    vdma_set(handle, OFFSET_VDMA_S2MM_CONTROL_REGISTER, VDMA_CONTROL_REGISTER_RESET);
+    vdma_set(handle, OFFSET_VDMA_MM2S_CONTROL_REGISTER, VDMA_CONTROL_REGISTER_RESET);
+    munmap((void *)handle->vdmaVirtualAddress, 65535);
+    munmap((void *)handle->fb1VirtualAddress, handle->fbLength);
+    munmap((void *)handle->fb2VirtualAddress, handle->fbLength);
+    munmap((void *)handle->fb3VirtualAddress, handle->fbLength);
+    close(handle->vdmaHandler);
+}
+
+unsigned int vdma_get(vdma_handle *handle, int num) {
+    return handle->vdmaVirtualAddress[num>>2];
+}
+
+void vdma_set(vdma_handle *handle, int num, unsigned int val) {
+    handle->vdmaVirtualAddress[num>>2]=val;
+}
+
+void vdma_status_dump(int status) {
+    if (status & VDMA_STATUS_REGISTER_HALTED) printf(" halted"); else printf("running");
+    if (status & VDMA_STATUS_REGISTER_VDMAInternalError) printf(" vdma-internal-error");
+    if (status & VDMA_STATUS_REGISTER_VDMASlaveError) printf(" vdma-slave-error");
+    if (status & VDMA_STATUS_REGISTER_VDMADecodeError) printf(" vdma-decode-error");
+    if (status & VDMA_STATUS_REGISTER_StartOfFrameEarlyError) printf(" start-of-frame-early-error");
+    if (status & VDMA_STATUS_REGISTER_EndOfLineEarlyError) printf(" end-of-line-early-error");
+    if (status & VDMA_STATUS_REGISTER_StartOfFrameLateError) printf(" start-of-frame-late-error");
+    if (status & VDMA_STATUS_REGISTER_FrameCountInterrupt) printf(" frame-count-interrupt");
+    if (status & VDMA_STATUS_REGISTER_DelayCountInterrupt) printf(" delay-count-interrupt");
+    if (status & VDMA_STATUS_REGISTER_ErrorInterrupt) printf(" error-interrupt");
+    if (status & VDMA_STATUS_REGISTER_EndOfLineLateError) printf(" end-of-line-late-error");
+    printf(" frame-count:%d", (status & VDMA_STATUS_REGISTER_FrameCount) >> 16);
+    printf(" delay-count:%d", (status & VDMA_STATUS_REGISTER_DelayCount) >> 24);
+    printf("\n");
+}
+
+void vdma_s2mm_status_dump(vdma_handle *handle) {
+    int status = vdma_get(handle, OFFSET_VDMA_S2MM_STATUS_REGISTER);
+    printf("S2MM status register (%08x):", status);
+    vdma_status_dump(status);
+}
+
+void vdma_mm2s_status_dump(vdma_handle *handle) {
+    int status = vdma_get(handle, OFFSET_VDMA_MM2S_STATUS_REGISTER);
+    printf("MM2S status register (%08x):", status);
+    vdma_status_dump(status);
+}
+
+void vdma_start_triple_buffering(vdma_handle *handle) {
+    // Reset VDMA
+    vdma_set(handle, OFFSET_VDMA_S2MM_CONTROL_REGISTER, VDMA_CONTROL_REGISTER_RESET);
+    vdma_set(handle, OFFSET_VDMA_MM2S_CONTROL_REGISTER, VDMA_CONTROL_REGISTER_RESET);
+
+    // Wait for reset to finish
+    while((vdma_get(handle, OFFSET_VDMA_S2MM_CONTROL_REGISTER) & VDMA_CONTROL_REGISTER_RESET)==4);
+    while((vdma_get(handle, OFFSET_VDMA_MM2S_CONTROL_REGISTER) & VDMA_CONTROL_REGISTER_RESET)==4);
+
+    // Clear all error bits in status register
+    vdma_set(handle, OFFSET_VDMA_S2MM_STATUS_REGISTER, 0);
+    vdma_set(handle, OFFSET_VDMA_MM2S_STATUS_REGISTER, 0);
+
+    // Do not mask interrupts
+    vdma_set(handle, OFFSET_VDMA_S2MM_IRQ_MASK, 0xf);
+
+    int interrupt_frame_count = 3;
+
+    // Start both S2MM and MM2S in triple buffering mode
+    vdma_set(handle, OFFSET_VDMA_S2MM_CONTROL_REGISTER,
+        (interrupt_frame_count << 16) |
+        VDMA_CONTROL_REGISTER_START |
+        VDMA_CONTROL_REGISTER_GENLOCK_ENABLE |
+        VDMA_CONTROL_REGISTER_INTERNAL_GENLOCK |
+        VDMA_CONTROL_REGISTER_CIRCULAR_PARK);
+    vdma_set(handle, OFFSET_VDMA_MM2S_CONTROL_REGISTER,
+        (interrupt_frame_count << 16) |
+        VDMA_CONTROL_REGISTER_START |
+        VDMA_CONTROL_REGISTER_GENLOCK_ENABLE |
+        VDMA_CONTROL_REGISTER_INTERNAL_GENLOCK |
+        VDMA_CONTROL_REGISTER_CIRCULAR_PARK);
+
+
+    while((vdma_get(handle, 0x30)&1)==0 || (vdma_get(handle, 0x34)&1)==1) {
+        printf("Waiting for VDMA to start running...\n");
+        sleep(1);
+    }
+
+    // Extra register index, use first 16 frame pointer registers
+    vdma_set(handle, OFFSET_VDMA_S2MM_REG_INDEX, 0);
+
+    // Write physical addresses to control register
+    vdma_set(handle, OFFSET_VDMA_S2MM_FRAMEBUFFER1, handle->fb1PhysicalAddress);
+    vdma_set(handle, OFFSET_VDMA_MM2S_FRAMEBUFFER1, handle->fb1PhysicalAddress);
+    vdma_set(handle, OFFSET_VDMA_S2MM_FRAMEBUFFER2, handle->fb2PhysicalAddress);
+    vdma_set(handle, OFFSET_VDMA_MM2S_FRAMEBUFFER2, handle->fb2PhysicalAddress);
+    vdma_set(handle, OFFSET_VDMA_S2MM_FRAMEBUFFER3, handle->fb3PhysicalAddress);
+    vdma_set(handle, OFFSET_VDMA_MM2S_FRAMEBUFFER3, handle->fb3PhysicalAddress);
+
+    // Write Park pointer register
+    vdma_set(handle, OFFSET_PARK_PTR_REG, 0);
+
+    // Frame delay and stride (bytes)
+    vdma_set(handle, OFFSET_VDMA_S2MM_FRMDLY_STRIDE, handle->width*handle->pixelLength);
+    vdma_set(handle, OFFSET_VDMA_MM2S_FRMDLY_STRIDE, handle->width*handle->pixelLength);
+
+    // Write horizontal size (bytes)
+    vdma_set(handle, OFFSET_VDMA_S2MM_HSIZE, handle->width*handle->pixelLength);
+    vdma_set(handle, OFFSET_VDMA_MM2S_HSIZE, handle->width*handle->pixelLength);
+
+    // Write vertical size (lines), this actually starts the transfer
+    vdma_set(handle, OFFSET_VDMA_S2MM_VSIZE, handle->height);
+    vdma_set(handle, OFFSET_VDMA_MM2S_VSIZE, handle->height);
+}
+
+int vdma_running(vdma_handle *handle) {
+    // Check whether VDMA is running, that is ready to start transfers
+    return (vdma_get(handle, 0x34)&1)==1;
+}
+
+int vdma_idle(vdma_handle *handle) {
+    // Check whtether VDMA is transferring
+    return (vdma_get(handle, OFFSET_VDMA_S2MM_STATUS_REGISTER) & VDMA_STATUS_REGISTER_FrameCountInterrupt)!=0;
+}
+
+int main() {
+    int j, i;
+    vdma_handle handle;
+
+    // Setup VDMA handle and memory-mapped ranges
+    vdma_setup(&handle, 0x43000000, 640, 480, 4, 0x0e000000, 0x0f000000, 0x10000000);
+
+    // Start triple buffering
+    vdma_start_triple_buffering(&handle);
+
+    // Run for 10 seconds, just monitor status registers
+    for(i=0; i<10; i++) {
+        vdma_s2mm_status_dump(&handle);
+        vdma_mm2s_status_dump(&handle);
+        printf("FB1:\n");
+        for (j = 0; j < 256; j++) printf(" %02x", handle.fb1VirtualAddress[j]); printf("\n");
+        sleep(1);
+    }
+
+    // Halt VDMA and unmap memory ranges
+    vdma_halt(&handle);
+}
+Note that this is just a demo code which is not exactly usable for any practical application mainly because the memory ranges assigned for framebuffers are not reserved by any kernel module. For real applications AXI (V)DMA driver should be used. It builds proper abstraction such as /dev/axi_dma_0 or /dev/axi_vdma_0 which can be accessed from userspace applications [3].
+
+[2]	http://arbot.cz/post/2013/03/20/VDMA-on-ZedBoard.aspx
+[3]	https://github.com/Xilinx/linux-xlnx/tree/master/drivers/dma/xilinx
+Grabbing frames over HTTP
+Once the VDMA transfer is running you can use following Python snippet on the ZYBO to grab a frame from DDR memory and serve it over HTTP:
+
+import os, png, mmap, BaseHTTPServer
+
+FRAMEBUFFER_OFFSET=0x0e000000
+WIDTH = 640
+HEIGHT = 480
+PIXEL_SIZE = 4
+
+fh = os.open("/dev/mem", os.O_SYNC | os.O_RDONLY) # Disable cache, read-only
+mm = mmap.mmap(fh, WIDTH*HEIGHT*PIXEL_SIZE, mmap.MAP_SHARED, mmap.PROT_READ, offset=FRAMEBUFFER_OFFSET)
+class MyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
+    def do_GET(s):
+        writer = png.Writer(WIDTH, HEIGHT, alpha=True)
+        s.send_response(200)
+        s.send_header("Content-type", "image/png")
+        s.end_headers()
+        writer.write_array(s.wfile,[ord(j) for j in mm[0:WIDTH*HEIGHT*PIXEL_SIZE]] )
+
+httpd = BaseHTTPServer.HTTPServer(("0.0.0.0", 80), MyHandler)
+try:
+    httpd.serve_forever()
+except KeyboardInterrupt:
+    pass
+httpd.server_close()
+
+mm.close()
+fh.close()
+Simply open http://zybo-ip-address:80 on your laptop assuming that the laptop and ZYBO are attached to same network.
+
+Interfacing with OV7670 camera module
+The Hamsterworks controller block can be reused to initialize the camera, there are no modifications required there. The Hamsterworks capture component however is not suitable for interfacing with AXI4-Stream Video compatible cores. Thus we need a slightly modified block which generates corresponding frame and line synchronization primitives.
+
+----------------------------------------------------------------------------------
+-- Authors: Mike Field <hamster@snap.net.nz>
+--          Lauir Vosandi <lauri.vosandi@gmail.com>
+----------------------------------------------------------------------------------
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity ov7670_axi_stream_capture is
+    port (
+        pclk              : in  std_logic;
+        vsync             : in  std_logic;
+        href              : in  std_logic;
+        d                 : in  std_logic_vector (7 downto 0);
+        m_axis_tvalid     : out std_logic;
+        m_axis_tready     : in  std_logic;
+        m_axis_tlast      : out std_logic;
+        m_axis_tdata      : out std_logic_vector ( 31 downto 0 );
+        m_axis_tuser      : out std_logic;
+        aclk              : out std_logic
+    );
+end ov7670_axi_stream_capture;
+
+architecture behavioral of ov7670_axi_stream_capture is
+    signal d_latch          : std_logic_vector(15 downto 0) := (others => '0');
+    signal address          : std_logic_vector(18 downto 0) := (others => '0');
+    signal line             : std_logic_vector(1 downto 0)  := (others => '0');
+    signal href_last        : std_logic_vector(6 downto 0)  := (others => '0');
+    signal we_reg           : std_logic := '0';
+    signal href_hold        : std_logic := '0';
+    signal latched_vsync    : std_logic := '0';
+    signal latched_href     : std_logic := '0';
+    signal latched_d        : std_logic_vector (7 downto 0) := (others => '0');
+    signal sof              : std_logic := '0';
+    signal eol              : std_logic := '0';
+begin
+     -- Expand 16-bit RGB (5:6:5) to 32-bit RGBA (8:8:8:8)
+     m_axis_tdata  <= "11111111"  & d_latch(4 downto 0) & d_latch(0) & d_latch(0) & d_latch(0) & d_latch(10 downto 5) & d_latch(5) & d_latch(5) & d_latch(15 downto 11) & d_latch(11) & d_latch(11) & d_latch(11);
+     m_axis_tvalid <= we_reg;
+     m_axis_tlast <= eol;
+     m_axis_tuser <= sof;
+     aclk <= not pclk;
+
+capture_process: process(pclk)
+begin
+    if rising_edge(pclk) then
+        if we_reg = '1' then
+            address <= std_logic_vector(unsigned(address)+1);
+        end if;
+
+        if href_hold = '0' and latched_href = '1' then
+            case line is
+                when "00" => line <= "01";
+                when "01" => line <= "10";
+                when "10" => line <= "11";
+                when others => line <= "00";
+            end case;
+        end if;
+        href_hold <= latched_href;
+
+        -- Capturing the data from the camera
+        if latched_href = '1' then
+            d_latch <= d_latch( 7 downto 0) & latched_d;
+        end if;
+        we_reg  <= '0';
+
+        -- Is a new screen about to start (i.e. we have to restart capturing)
+        if latched_vsync = '1' then
+            address        <= (others => '0');
+            href_last     <= (others => '0');
+            line            <= (others => '0');
+        else
+            -- If not, set the write enable whenever we need to capture a pixel
+            if href_last(0) = '1' then
+                we_reg <= '1';
+                href_last <= (others => '0');
+            else
+                href_last <= href_last(href_last'high-1 downto 0) & latched_href;
+            end if;
+        end if;
+
+        case unsigned(address) mod 640 = 639 is
+            when true => eol <= '1';
+            when others => eol <= '0';
+        end case;
+
+        case unsigned(address) = 0 is
+            when true => sof <= '1';
+            when others => sof <= '0';
+        end case;
+    end if;
+    if falling_edge(pclk) then
+        latched_d     <= d;
+        latched_href  <= href;
+        latched_vsync <= vsync;
+    end if;
+end process;
+end behavioral;
+Modified block converts 16-bit RGB (5:6:5) signal to 32-bit RGBA (8:8:8:8) signal with fake opaque alpha channel. This way whole pixel is transferred during one AXI bus cycle and start-of-frame and end-of-line signals are perfectly aliged with the content.
+
+Substituting test pattern generator with the modified capture block and adding controller block should be enough to have the video input from the camera connected to AXI4-Stream Video compatible pipeline.
+
+[4]	http://www.voti.nl/docs/OV7670.pdf
+Video4Linux2 driver
+As Zynq-7000 boards have I²C bus master built-in, it make sense to take advantage of that feature instead of implementing controller block from scratch. On ZYBO the EEPROM and audio codec are connected to the I²C bus, but it should be possible to route I²C bus to Pmod connectors using IIC_0 port on Zynq7 processing system block. It should also be possible to access the I²C bus via /dev/i2c-0 device node if corresponding kernel modules have been loaded [5]. This should make it possible to take advantage of OV7670 kernel module [6] which was written for One Laptop Per Child project. This way the camera initialization can be done by kernel and the camera can be configured via any Video4Linux application instead of static bitstream. How transferring the frames could be done in this case is not however clear yet.
+
+[5]	Scanning a I²C bus for available slave devices
+[6]	http://www.cs.fsu.edu/~baker/devices/lxr/http/source/linux/drivers/media/video/ov7670.c
+
+
+
+
+
+https://lauri.xn--vsandi-pxa.com/hdl/zynq/xilinx-video-output.html
+AXI4-Stream to Video Out
+
+The ports on board are connected as follows in case of ZYBO:
+
+https://reference.digilentinc.com/_media/zybo:vga1.png
+ZYBO's analog video output "DAC" is simply a resistor latter.
+
+VDMA component can be used to implement video output on Zynq-7000 boards.
+
+C code running on ARM cores
+VHDL code running on programmable fabric
+Kernel frame-
+buffer module
+(/dev/fb0)
+Userspace
+application
+(eg. Xorg)
+AXI4-Stream to
+Video Out v3.0
+AXI Video Direct
+Memory Access
+v6.2
+Video output
+(VGA, HDMI, etc)
+DDR memory
+Video Timing
+Controller v6.1
+Clocking
+Wizard
+Pixel clock 25MHz for 640x480@60Hz
+Video output pipeline employing single VDMA instance with only read channel, write channel is disabled
+
+Minimal working example
+TODO
+
+Kernel framebuffer driver
+TODO
+
+
+
+
+Related posts
+
+Video capture with VDMA
+ZYBO quickstart
+Accelerating AES cipher on Zynq SoC-s
+Compiling kernel for ZYBO
+https://lauri.xn--vsandi-pxa.com/hdl/zynq/zybo-compiling-kernel.html
+https://lauri.xn--vsandi-pxa.com/2014/05/zynq-soc.html
+https://lauri.xn--vsandi-pxa.com/hdl/zynq/zybo-quickstart.html
+Multiplexer
+Related posts
+
+AXI4-Stream to Video Out
+Multiplexer
+ZYBO quickstart
+Hardware description languages
+Full adder
+
+
+
+
